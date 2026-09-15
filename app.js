@@ -24,6 +24,8 @@
     recognition: null,
     recording: false,
     finalTranscript: '',
+    speechBase: '',
+    speechSession: '',
     installPrompt: null
   };
 
@@ -194,14 +196,87 @@
     const top=pairs.sort((a,b)=>b.s-a.s).slice(0,6); list.innerHTML=top.length?top.map(p=>`<div class="connection-item"><b>${escapeHtml(p.a.title)} ↔ ${escapeHtml(p.b.title)}</b><p>${Math.round(p.s*100)}% 유사 · 공통 키워드와 문맥을 기준으로 연결</p></div>`).join(''):'<div class="empty-state">서로 다른 생각들이 쌓이고 있습니다. 아직 강한 연결은 없습니다.</div>';
   }
 
+  function dedupeSpeech(text=''){
+    const words=compact(text).split(' ').filter(Boolean);
+    const out=[];
+    for(const word of words){
+      out.push(word);
+      // Android Web Speech sometimes re-emits the same phrase while refining
+      // an interim result. Remove only exact adjacent repetitions.
+      let changed=true;
+      while(changed){
+        changed=false;
+        const max=Math.min(10,Math.floor(out.length/2));
+        for(let n=max;n>=1;n--){
+          const a=out.slice(out.length-2*n,out.length-n).join(' ');
+          const b=out.slice(out.length-n).join(' ');
+          if(a && a===b){
+            out.splice(out.length-n,n);
+            changed=true;
+            break;
+          }
+        }
+      }
+    }
+    return out.join(' ');
+  }
+
   function setupSpeech(){
     const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
     if(!SR){ $('#micStatus').textContent='이 브라우저는 음성 인식을 지원하지 않습니다.'; $('#micBtn').disabled=true; return; }
-    const r=new SR(); r.lang=state.settings.lang||'ko-KR'; r.continuous=true; r.interimResults=true;
-    r.onstart=()=>{state.recording=true;$('#micBtn').classList.add('recording');$('#micBtn .mic-label').textContent='말하는 중…';$('#micStatus').textContent='말을 멈추면 자동으로 정리됩니다.';state.finalTranscript=$('#ideaInput').value.trim();};
-    r.onresult=(e)=>{let interim='',finalAdd='';for(let i=e.resultIndex;i<e.results.length;i++){const tx=e.results[i][0].transcript;if(e.results[i].isFinal)finalAdd+=tx+' ';else interim+=tx;}if(finalAdd)state.finalTranscript=compact(`${state.finalTranscript} ${finalAdd}`);$('#ideaInput').value=compact(`${state.finalTranscript} ${interim}`);};
-    r.onerror=(e)=>{ if(e.error!=='no-speech') toast(`음성 인식: ${e.error}`); };
-    r.onend=()=>{state.recording=false;$('#micBtn').classList.remove('recording');$('#micBtn .mic-label').textContent='눌러서 말하기';$('#micStatus').textContent=$('#ideaInput').value.trim()?'기록 완료 · 저장하면 자동으로 발전시킵니다.':'대기 중';};
+
+    const r=new SR();
+    r.lang=state.settings.lang||'ko-KR';
+    // v0.1.2: one utterance per tap. This avoids Android Chrome repeatedly
+    // appending revised interim/final transcripts.
+    r.continuous=false;
+    r.interimResults=true;
+    r.maxAlternatives=1;
+
+    r.onstart=()=>{
+      state.recording=true;
+      state.speechBase=$('#ideaInput').value.trim();
+      state.speechSession='';
+      state.finalTranscript=state.speechBase;
+      $('#micBtn').classList.add('recording');
+      $('#micBtn .mic-label').textContent='말하는 중…';
+      $('#micStatus').textContent='한 번 편하게 말하세요. 잠시 멈추면 자동으로 끝납니다.';
+    };
+
+    r.onresult=(e)=>{
+      const finalParts=[];
+      const interimParts=[];
+
+      // Rebuild the current recognition session from the browser's latest
+      // snapshot instead of appending each event. This prevents duplication.
+      for(let i=0;i<e.results.length;i++){
+        const tx=compact(e.results[i][0].transcript||'');
+        if(!tx) continue;
+        if(e.results[i].isFinal) finalParts.push(tx);
+        else interimParts.push(tx);
+      }
+
+      const finalized=dedupeSpeech(finalParts.join(' '));
+      const preview=dedupeSpeech([...finalParts,...interimParts].join(' '));
+      state.speechSession=finalized || preview;
+      state.finalTranscript=compact(`${state.speechBase} ${finalized}`);
+      $('#ideaInput').value=compact(`${state.speechBase} ${preview}`);
+    };
+
+    r.onerror=(e)=>{
+      if(e.error!=='no-speech') toast(`음성 인식: ${e.error}`);
+    };
+
+    r.onend=()=>{
+      state.recording=false;
+      const current=$('#ideaInput').value.trim();
+      state.finalTranscript=current;
+      state.speechSession='';
+      $('#micBtn').classList.remove('recording');
+      $('#micBtn .mic-label').textContent='눌러서 말하기';
+      $('#micStatus').textContent=current?'기록 완료 · 이어 말하려면 다시 누르세요.':'대기 중';
+    };
+
     state.recognition=r;
   }
   function toggleSpeech(){
@@ -215,7 +290,7 @@
   }
 
   function exportData(){
-    const blob=new Blob([JSON.stringify({version:'0.1',exportedAt:nowIso(),ideas:state.ideas,settings:{lang:state.settings.lang}},null,2)],{type:'application/json'});
+    const blob=new Blob([JSON.stringify({version:'0.1.2',exportedAt:nowIso(),ideas:state.ideas,settings:{lang:state.settings.lang}},null,2)],{type:'application/json'});
     const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`idea-lab-backup-${new Date().toISOString().slice(0,10)}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
   }
   async function importData(file){
@@ -233,7 +308,7 @@
     try{
       const headers={'Content-Type':'application/json'}; if(state.settings.aiToken)headers['Authorization']=`Bearer ${state.settings.aiToken}`;
       const rel=relatedTo(x,3).map(r=>({title:r.idea.title,summary:r.idea.summary,score:r.score}));
-      const res=await fetch(endpoint,{method:'POST',headers,body:JSON.stringify({app:'idea-lab',version:'0.1',idea:x,related:rel})});
+      const res=await fetch(endpoint,{method:'POST',headers,body:JSON.stringify({app:'idea-lab',version:'0.1.2',idea:x,related:rel})});
       if(!res.ok)throw new Error(`HTTP ${res.status}`);
       const data=await res.json();
       x.aiResult = data.result || data.analysis || data.text || JSON.stringify(data,null,2); x.updatedAt=nowIso();saveIdeas();renderDetail();toast('AI 심화 분석을 받았습니다.');
